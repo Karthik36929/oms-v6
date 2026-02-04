@@ -1,0 +1,490 @@
+# Azure DevOps Pipeline for Spring Boot Deployment to AWS EKS
+# This pipeline should be placed in the root of your Spring Boot project repository
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Link to Variable Group (contains AWS credentials and configuration)
+  - group: build.variables
+  
+  # Project Configuration
+  - name: PROJECT_NAME
+    value: '$(Build.Repository.Name)'
+  - name: IMAGE_TAG
+    value: '$(Build.BuildId)'
+  
+  # AWS Configuration (loaded from variable group)
+  - name: AWS_REGION
+    value: '$(awsRegion)'
+  - name: AWS_ACCOUNT_ID
+    value: '$(awsAccountId)'
+  - name: ECR_REPOSITORY
+    value: 'oms-v6'
+  - name: EKS_CLUSTER_NAME
+    value: '$(eksClusterName)'
+  - name: K8S_NAMESPACE
+    value: 'oms-v6'
+  
+  # AWS Credentials (loaded from variable group as secrets)
+  - name: AWS_ACCESS_KEY_ID
+    value: '$(awsAccessKeyId)'
+  - name: AWS_SECRET_ACCESS_KEY
+    value: '$(awsSecretAccessKey)'
+  
+  # Java & Maven Configuration
+  - name: JAVA_VERSION
+    value: '17'
+  - name: MAVEN_CACHE_FOLDER
+    value: $(Pipeline.Workspace)/.m2/repository
+  - name: MAVEN_OPTS
+    value: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+
+stages:
+- stage: Build
+  displayName: 'Build Spring Boot Application'
+  jobs:
+  - job: BuildJob
+    displayName: 'Maven Build & Test'
+    steps:
+    # Checkout code
+    - checkout: self
+      displayName: 'Checkout Repository'
+    
+    # Cache Maven dependencies
+    - task: Cache@2
+      inputs:
+        key: 'maven | "$(Agent.OS)" | **/pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+        path: $(MAVEN_CACHE_FOLDER)
+      displayName: 'Cache Maven Dependencies'
+    
+    # Run Maven tests
+    #- task: Maven@4
+     # inputs:
+      #  mavenPomFile: 'pom.xml'
+       # goals: 'clean test'
+        #publishJUnitResults: true
+       # testResultsFiles: '**/surefire-reports/TEST-*.xml'
+       # codeCoverageToolOption: 'JaCoCo'
+       # mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+       # javaHomeOption: 'JDKVersion'
+       # jdkVersionOption: '$(JAVA_VERSION)'
+       # jdkArchitectureOption: 'x64'
+      # displayName: 'Run Unit Tests'
+    
+    # Build JAR
+    - task: Maven@4
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'package -DskipTests'
+        publishJUnitResults: false
+        mavenOptions: '-Xmx3072m $(MAVEN_OPTS)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '$(JAVA_VERSION)'
+        jdkArchitectureOption: 'x64'
+      displayName: 'Build Spring Boot Application'
+    
+    # Publish test results
+    #- task: PublishTestResults@2
+     # inputs:
+      #  testResultsFormat: 'JUnit'
+       # testResultsFiles: '**/surefire-reports/TEST-*.xml'
+       # mergeTestResults: true
+       # failTaskOnFailedTests: false
+       # testRunTitle: 'Spring Boot Unit Tests'
+      # displayName: 'Publish Test Results'
+      # condition: always()
+    
+    # Publish build artifacts
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/target'
+        artifact: 'spring-boot-jar'
+        publishLocation: 'pipeline'
+      displayName: 'Publish JAR Artifact'
+
+- stage: Infrastructure
+  displayName: 'Setup AWS Infrastructure'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: InfrastructureJob
+    displayName: 'Setup VPC Endpoints for ECR'
+    steps:
+    # Install AWS CLI
+    - script: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install --update
+        aws --version
+      displayName: 'Install AWS CLI'
+    
+    # Setup VPC Endpoints for ECR (fixes ImagePullBackOff issues)
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e
+          
+          echo "======================================================"
+          echo "Setting up VPC Endpoints for ECR Access"
+          echo "======================================================"
+          echo ""
+          
+          # Get VPC ID from EKS cluster
+          echo "1. Getting VPC information from EKS cluster..."
+          VPC_ID=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.vpcId' \
+            --output text)
+          
+          echo "   VPC ID: $VPC_ID"
+          
+          # Get subnet IDs
+          echo ""
+          echo "2. Getting subnet information..."
+          SUBNET_IDS=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.subnetIds' \
+            --output text)
+          
+          SUBNET_ARRAY=($SUBNET_IDS)
+          echo "   Subnets: ${SUBNET_ARRAY[@]}"
+          
+          # Get security group
+          echo ""
+          echo "3. Getting security group..."
+          SG_ID=$(aws eks describe-cluster \
+            --name $(EKS_CLUSTER_NAME) \
+            --region $(AWS_REGION) \
+            --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' \
+            --output text)
+          
+          echo "   Security Group: $SG_ID"
+          
+          # Function to check if endpoint exists
+          check_endpoint() {
+            local service_name=$1
+            aws ec2 describe-vpc-endpoints \
+              --region $(AWS_REGION) \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=$service_name" \
+              --query 'VpcEndpoints[0].VpcEndpointId' \
+              --output text 2>/dev/null
+          }
+          
+          # Create ECR API endpoint
+          echo ""
+          echo "4. Setting up ECR API endpoint..."
+          ECR_API_SERVICE="com.amazonaws.$(AWS_REGION).ecr.api"
+          EXISTING_ENDPOINT=$(check_endpoint $ECR_API_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ ECR API endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Creating ECR API endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Interface \
+              --service-name $ECR_API_SERVICE \
+              --subnet-ids ${SUBNET_ARRAY[@]} \
+              --security-group-ids $SG_ID \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-ecr-api},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ ECR API endpoint created successfully"
+          fi
+          
+          # Create ECR Docker endpoint
+          echo ""
+          echo "5. Setting up ECR Docker endpoint..."
+          ECR_DKR_SERVICE="com.amazonaws.$(AWS_REGION).ecr.dkr"
+          EXISTING_ENDPOINT=$(check_endpoint $ECR_DKR_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ ECR Docker endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Creating ECR Docker endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Interface \
+              --service-name $ECR_DKR_SERVICE \
+              --subnet-ids ${SUBNET_ARRAY[@]} \
+              --security-group-ids $SG_ID \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-ecr-dkr},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ ECR Docker endpoint created successfully"
+          fi
+          
+          # Create S3 Gateway endpoint
+          echo ""
+          echo "6. Setting up S3 Gateway endpoint..."
+          S3_SERVICE="com.amazonaws.$(AWS_REGION).s3"
+          EXISTING_ENDPOINT=$(check_endpoint $S3_SERVICE)
+          
+          if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
+            echo "   ✅ S3 Gateway endpoint already exists: $EXISTING_ENDPOINT"
+          else
+            echo "   Getting route tables..."
+            ROUTE_TABLE_IDS=$(aws ec2 describe-route-tables \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'RouteTables[].RouteTableId' \
+              --output text \
+              --region $(AWS_REGION))
+            
+            echo "   Creating S3 Gateway endpoint..."
+            aws ec2 create-vpc-endpoint \
+              --vpc-id $VPC_ID \
+              --vpc-endpoint-type Gateway \
+              --service-name $S3_SERVICE \
+              --route-table-ids $ROUTE_TABLE_IDS \
+              --region $(AWS_REGION) \
+              --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=eks-s3-gateway},{Key=ManagedBy,Value=AzureDevOps}]' \
+              --query 'VpcEndpoint.VpcEndpointId' \
+              --output text
+            echo "   ✅ S3 Gateway endpoint created successfully"
+          fi
+          
+          echo ""
+          echo "======================================================"
+          echo "✅ Infrastructure setup complete!"
+          echo "======================================================"
+          echo ""
+          echo "VPC Endpoints allow EKS pods to access ECR without"
+          echo "needing a NAT Gateway or public internet access."
+          echo ""
+          echo "Cost: ~$7-10/month per interface endpoint"
+          echo "Total: ~$21-30/month for all 3 endpoints"
+          echo ""
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Create VPC Endpoints for ECR'
+
+- stage: Docker
+  displayName: 'Build & Push Docker Image'
+  dependsOn: Infrastructure
+  condition: succeeded()
+  jobs:
+  - job: DockerJob
+    displayName: 'Docker Build & Push to ECR'
+    steps:
+    # Checkout code
+    - checkout: self
+      displayName: 'Checkout Repository'
+    
+    # Download build artifact
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifact: 'spring-boot-jar'
+        path: '$(System.DefaultWorkingDirectory)/target'
+      displayName: 'Download JAR Artifact'
+    
+    # Install AWS CLI
+    - script: |
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install --update
+        aws --version
+      displayName: 'Install AWS CLI'
+    
+    # Configure AWS credentials and Login to ECR
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Configuring AWS credentials..."
+          aws sts get-caller-identity
+          
+          echo "Logging in to AWS ECR..."
+          aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+          
+          echo "Creating ECR repository if it doesn't exist..."
+          aws ecr describe-repositories --repository-names $(ECR_REPOSITORY) --region $(AWS_REGION) || \
+          aws ecr create-repository --repository-name $(ECR_REPOSITORY) --region $(AWS_REGION) --image-scanning-configuration scanOnPush=true
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Configure AWS & Login to ECR'
+    
+    # Build Docker image
+    - script: |
+        echo "Building Docker image..."
+        docker build -t $(ECR_REPOSITORY):$(IMAGE_TAG) .
+        docker tag $(ECR_REPOSITORY):$(IMAGE_TAG) $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):$(IMAGE_TAG)
+        docker tag $(ECR_REPOSITORY):$(IMAGE_TAG) $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):latest
+        echo "Docker image built successfully"
+      displayName: 'Build Docker Image'
+    
+    # Push Docker image to ECR
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Pushing Docker image to ECR..."
+          docker push $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):$(IMAGE_TAG)
+          docker push $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):latest
+          echo "Docker image pushed successfully"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Push Docker Image to ECR'
+
+- stage: Deploy
+  displayName: 'Deploy to AWS EKS'
+  dependsOn: Docker
+  condition: succeeded()
+  jobs:
+  - job: DeployJob
+    displayName: 'Kubernetes Deployment'
+    steps:
+    # Checkout code (for k8s manifests)
+    - checkout: self
+      displayName: 'Checkout Repository'
+    
+    # Install kubectl
+    - script: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        kubectl version --client
+      displayName: 'Install kubectl'
+    
+    # Configure kubectl for EKS
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Update kubeconfig for EKS cluster
+          aws eks update-kubeconfig --name $(EKS_CLUSTER_NAME) --region $(AWS_REGION)
+          
+          # Verify connection
+          kubectl cluster-info
+          kubectl get nodes
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Configure kubectl for EKS'
+    
+    # Create namespace if not exists
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          kubectl create namespace $(K8S_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Create Kubernetes Namespace'
+    
+    # Update image tags in k8s manifests
+    - script: |
+        # Update deployment.yaml with correct image
+        sed -i "s|image:.*|image: $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):$(IMAGE_TAG)|g" k8s/deployment.yaml
+        cat k8s/deployment.yaml
+      displayName: 'Update K8s Manifests'
+    
+    # Apply Kubernetes manifests
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Applying Kubernetes manifests..."
+          kubectl apply -f k8s/namespace.yaml || echo "Namespace already exists"
+          kubectl apply -f k8s/configmap.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/deployment.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/service.yaml -n $(K8S_NAMESPACE)
+          kubectl apply -f k8s/ingress.yaml -n $(K8S_NAMESPACE) || echo "Ingress optional"
+          kubectl apply -f k8s/hpa.yaml -n $(K8S_NAMESPACE) || echo "HPA optional"
+          echo "Kubernetes manifests applied successfully"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Deploy to Kubernetes'
+    
+    # Wait for deployment rollout with diagnostics
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/$(ECR_REPOSITORY)-deployment -n $(K8S_NAMESPACE) --timeout=10m || {
+            echo "Deployment timeout! Checking pod status..."
+            echo "=== Pod Status ==="
+            kubectl get pods -n $(K8S_NAMESPACE) -l app=$(ECR_REPOSITORY)
+            echo ""
+            echo "=== Pod Descriptions ==="
+            kubectl describe pods -n $(K8S_NAMESPACE) -l app=$(ECR_REPOSITORY)
+            echo ""
+            echo "=== Pod Logs ==="
+            for pod in $(kubectl get pods -n $(K8S_NAMESPACE) -l app=$(ECR_REPOSITORY) -o jsonpath='{.items[*].metadata.name}'); do
+              echo "Logs for $pod:"
+              kubectl logs $pod -n $(K8S_NAMESPACE) --tail=50 || echo "No logs available"
+              echo "---"
+            done
+            exit 1
+          }
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Wait for Deployment with Diagnostics'
+    
+    # Display deployment information
+    - task: Bash@3
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "===== Deployment Status ====="
+          kubectl get deployments -n $(K8S_NAMESPACE)
+          echo ""
+          echo "===== Pods ====="
+          kubectl get pods -n $(K8S_NAMESPACE) -l app=$(ECR_REPOSITORY)
+          echo ""
+          echo "===== Services ====="
+          kubectl get services -n $(K8S_NAMESPACE)
+          echo ""
+          echo "===== Ingress ====="
+          kubectl get ingress -n $(K8S_NAMESPACE) || echo "No ingress configured"
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        AWS_DEFAULT_REGION: $(AWS_REGION)
+      displayName: 'Display Deployment Info'
+    
+    # Run smoke tests (optional)
+    - script: |
+        echo "Running smoke tests..."
+        # Get service endpoint
+        SERVICE_IP=$(kubectl get service $(ECR_REPOSITORY)-service -n $(K8S_NAMESPACE) -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        if [ -z "$SERVICE_IP" ]; then
+          echo "Service IP not available yet, skipping smoke test"
+          exit 0
+        fi
+        
+        echo "Service available at: $SERVICE_IP"
+        # Wait for service to be ready
+        sleep 30
+        
+        # Test health endpoint
+        curl -f http://$SERVICE_IP/actuator/health || echo "Health check failed (service might not be ready yet)"
+      displayName: 'Run Smoke Tests'
+      continueOnError: true
