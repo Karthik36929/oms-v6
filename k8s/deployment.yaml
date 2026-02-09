@@ -29,8 +29,8 @@ spec:
           value: "-Xms256m -Xmx768m"
         resources:
           requests:
-            memory: "1Gi"
-            cpu: "500m"
+            memory: "512Mi"
+            cpu: "250m"
           limits:
             memory: "512Mi"
             cpu: "250m"
@@ -48,7 +48,7 @@ spec:
           httpGet:
             path: /actuator/health/liveness
             port: 8080
-          initialDelaySeconds: 60
+          initialDelaySeconds: 0
           periodSeconds: 10
           timeoutSeconds: 3
           failureThreshold: 3
@@ -56,7 +56,7 @@ spec:
           httpGet:
             path: /actuator/health/readiness
             port: 8080
-          initialDelaySeconds: 90
+          initialDelaySeconds: 0
           periodSeconds: 10
           timeoutSeconds: 3
           failureThreshold: 3
